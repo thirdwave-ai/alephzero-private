@@ -24,7 +24,7 @@ struct BenchFixture {
   }
 
   ~BenchFixture() {
-    a0_transport_unlock(lk);
+    a0_transport_unlock(&lk);
     a0_transport_close(&transport);
     a0_shm_close(&shm);
     a0_shm_unlink(BENCH_SHM);

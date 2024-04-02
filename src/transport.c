@@ -10,12 +10,29 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include <glib-2.0/glib.h>
 
 #include "atomic.h"
 #include "ftx.h"
 #include "macros.h"
 #include "mtx.h"
+#include "pmparser.h"
+
+// Use MONOTONIC_COARSE to avoid syscall cost at the expense of reduced resolution.
+// On our systems, the coarse clock has a 4ms resolution, which is still good enough
+// for >200Hz timings.
+#define A0_PERF_CLOCK_SOURCE CLOCK_MONOTONIC_COARSE
+
+// Mutex covering a0_global_reverse_mmap.
+// This initial value is equivalent to having called a0_mutex_init.
+static a0_mtx_t a0_global_reverse_mmap_mu = (a0_mtx_t){0};
+
+// Hash table for caching memory location<->mapped file associations.
+static GHashTable* a0_global_reverse_mmap = NULL;
 
 typedef uintptr_t transport_off_t;  // ptr offset from start of the arena.
 
@@ -133,16 +150,16 @@ errno_t a0_transport_init_metadata(a0_locked_transport_t lk, size_t metadata_siz
 }
 
 A0_STATIC_INLINE
-void a0_wait_for_notify(a0_locked_transport_t lk) {
-  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk.transport->_arena.ptr;
+void a0_wait_for_notify(a0_locked_transport_t* lk) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk->transport->_arena.ptr;
 
-  uint32_t key = lk.transport->_lk_tkn;
+  uint32_t key = lk->transport->_lk_tkn;
   hdr->ftxcv = key;
   hdr->has_notify_listener = true;
 
   a0_transport_unlock(lk);
   a0_ftx_wait(&hdr->ftxcv, key, NULL);
-  a0_transport_lock(lk.transport, &lk);
+  a0_transport_lock(lk->transport, lk);
 }
 
 A0_STATIC_INLINE
@@ -158,15 +175,137 @@ errno_t a0_transport_close(a0_transport_t* transport) {
   a0_schedule_notify(lk);
 
   while (transport->_await_cnt) {
-    a0_wait_for_notify(lk);
+    a0_wait_for_notify(&lk);
   }
 
-  a0_transport_unlock(lk);
+  a0_transport_unlock(&lk);
 
   return A0_OK;
 }
 
+
+// Given a memory pointer (the transport arena pointer by convention)
+// return the OS path of the memory mapped file backing it. Returns
+// "Unknown" if the address is unknown in the memory map or there's
+// a problem reading the memory map. Returns "" if the address is not
+// backed by a mmapped file-like object.
+//
+// This function attempts to cache its results in a global cache to
+// enable fast return. Otherwise it parses the process /proc/self/maps
+// file to determine the mmap status.
+//
+// This function is threadsafe.
+//
+// Note: This cache currently has no invalidation or eviction policy.
+A0_STATIC_INLINE
+char* a0_reverse_map_arena_to_path(a0_transport_hdr_t* arena) {
+  // Note: This allocates a hash table and all the values and
+  // makes no attempt to clean any of it up. This memory is intended
+  // to live for the life of the program and thus freeing is not a priority.
+  // This is only valid if the assumption that transports are rarely
+  // destroyed holds.
+
+  // Lock the memory map.
+  errno_t lock_status = a0_mtx_lock(&a0_global_reverse_mmap_mu);
+  if (A0_UNLIKELY(lock_status == EOWNERDEAD)) {
+    lock_status = a0_mtx_consistent(&a0_global_reverse_mmap_mu);
+  }
+
+  if (a0_global_reverse_mmap == NULL) {
+    a0_global_reverse_mmap = g_hash_table_new(NULL, NULL);
+  }
+  char* maybe_path = g_hash_table_lookup(a0_global_reverse_mmap, arena);
+  if (maybe_path) {
+    // Fast-path: We already have an entry. Unlock the map and return.
+    a0_mtx_unlock(&a0_global_reverse_mmap_mu);
+    return maybe_path;
+  }
+
+  // Fetch the process map.  We do this every time if we've missed in the
+  // hash map in case there have been subsequent mmappings.
+  procmaps_iterator* pmparse = pmparser_parse(-1);
+  char* pathname = "Unknown";
+  if (!pmparse) {
+    // Bail out if we were unable to read the memory map.
+    // Don't cache the Unknown result.
+    a0_mtx_unlock(&a0_global_reverse_mmap_mu);
+    return pathname;
+  }
+
+  procmaps_struct* entry = NULL;
+  while ((entry = pmparser_next(pmparse))) {
+    // Look for an address in the range. We expect to find an mmapped
+    // file path here.
+    if (entry->addr_start <= (void*)(arena) && entry->addr_end > (void*)(arena)) {
+      pathname = entry->pathname;
+      break;
+    }
+  }
+  // Fall-through on not-found will have pathname == "Unknown".  We will cache this
+  // version of unknown, since the transport might be in-memory for test purposes
+  // and we don't want to continually scan the memory map.
+
+  // Note: this string allocation has no associated free. This cache currently
+  // persists for the life of the program.
+  char* result = strdup(pathname);
+  g_hash_table_insert(a0_global_reverse_mmap, arena, result);
+
+  // Clean up the parser. Needs to be done after the pathname dup.
+  pmparser_free(pmparse);
+
+  a0_mtx_unlock(&a0_global_reverse_mmap_mu);
+  return result;
+}
+
+// Given a start time and end time, check to see if the timedelta is > the given
+// threshold (a number of nanoseconds).
+// If so:
+//  * Fetch the backing mmapped file path for the given @p arena
+//  * Emit a warning message on stderr with the path, the @p preamble and
+//    the measured and threshold timings.
+// If not:
+//  * Do nothing and return.
+A0_STATIC_INLINE
+void a0_warn_if_past_threshold(struct timespec* start, struct timespec* end, int64_t threshold_ns,
+                               const char* preamble, a0_transport_hdr_t* arena) {
+  int64_t seconds = end->tv_sec - start->tv_sec;
+  int64_t nanoseconds = (seconds * 1000000000) + (end->tv_nsec - start->tv_nsec);
+
+  if (A0_UNLIKELY(nanoseconds > threshold_ns) && (threshold_ns != 0)) {
+    char* arena_file = a0_reverse_map_arena_to_path(arena);
+    const double kMsPerNs = 1e-6;
+    fprintf(stderr, "Warning: [%s] %s %.3fms. Above threshold of %.3fms\n", arena_file, preamble, nanoseconds * kMsPerNs, threshold_ns * kMsPerNs);
+  }
+}
+
+A0_STATIC_INLINE
+void a0_warn_if_long_acquire(struct timespec* start, struct timespec* end, a0_transport_hdr_t* arena) {
+  const int64_t kDefaultAcquireWarnNs = 100000000;  // 100ms via rough engineering judgement. 10Hz is a nominal value in TWA systems.
+  // Static here to not cost a bunch of time on every entry.
+  static int64_t kAcquireWarnNs = -1;
+  if (A0_UNLIKELY(kAcquireWarnNs == -1)) {
+    kAcquireWarnNs = (getenv("A0_LOCK_ACQUIRE_WARN_NS")) ? atoll(getenv("A0_LOCK_ACQUIRE_WARN_NS")) : kDefaultAcquireWarnNs;
+  }
+
+  a0_warn_if_past_threshold(start, end, kAcquireWarnNs, "A0 Transport lock acquisition took", arena);
+}
+
+A0_STATIC_INLINE
+void a0_warn_if_long_hold(struct timespec* start, struct timespec* end, a0_transport_hdr_t* arena) {
+  const int64_t kDefaultHoldWarnNs = 100000000;  // 100ms via rough engineering judgement. 10Hz is a nominal value in TWA systems.
+  // Static here to not cost a bunch of time on every entry.
+  static int64_t kHoldWarnNs = -1;
+  if (A0_UNLIKELY(kHoldWarnNs == -1)) {
+    kHoldWarnNs = (getenv("A0_LOCK_HOLD_WARN_NS")) ? atoll(getenv("A0_LOCK_HOLD_WARN_NS")) : kDefaultHoldWarnNs;
+  }
+
+  a0_warn_if_past_threshold(start, end, kHoldWarnNs, "A0 Transport lock held for", arena);
+}
+
 errno_t a0_transport_lock(a0_transport_t* transport, a0_locked_transport_t* lk_out) {
+  struct timespec start_acquire;
+  A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_acquire), "Failed clock_gettime");
+
   a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)transport->_arena.ptr;
 
   lk_out->transport = transport;
@@ -178,6 +317,10 @@ errno_t a0_transport_lock(a0_transport_t* transport, a0_locked_transport_t* lk_o
     a0_schedule_notify(*lk_out);
   }
 
+  // Measure lock aquisition time and warn if necessary.
+  A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &(lk_out->lock_monotime)), "Failed clock_gettime");
+  a0_warn_if_long_acquire(&start_acquire, &(lk_out->lock_monotime), hdr);
+
   lk_out->transport->_lk_tkn = a0_atomic_inc_fetch(&hdr->next_ftxcv_tkn);
 
   // Clear any incomplete changes.
@@ -187,19 +330,30 @@ errno_t a0_transport_lock(a0_transport_t* transport, a0_locked_transport_t* lk_o
   return lock_status;
 }
 
-errno_t a0_transport_unlock(a0_locked_transport_t lk) {
-  *a0_transport_working_page(lk) = *a0_transport_committed_page(lk);
-  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk.transport->_arena.ptr;
-  if (hdr->has_notify_listener && lk.transport->_should_notify) {
+errno_t a0_transport_unlock(a0_locked_transport_t* lk) {
+  *a0_transport_working_page(*lk) = *a0_transport_committed_page(*lk);
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk->transport->_arena.ptr;
+  if (hdr->has_notify_listener && lk->transport->_should_notify) {
     // wait_for_notify unlocks (using this function) before starting the futex_wait.
     // In all other cases, futex_broadcast should clear has_notify_listener.
     // The following line effectively checks whether the unlock is part of wait_for_notify.
     // TODO(lshamis): This code is piped weird and should be cleaned up.
-    hdr->has_notify_listener = (hdr->ftxcv == lk.transport->_lk_tkn);
-    hdr->ftxcv = lk.transport->_lk_tkn;
+    hdr->has_notify_listener = (hdr->ftxcv == lk->transport->_lk_tkn);
+    hdr->ftxcv = lk->transport->_lk_tkn;
     a0_ftx_broadcast(&hdr->ftxcv);
   }
   a0_mtx_unlock(&hdr->mu);
+
+  // Note: This measures held time very liberally. i.e.: The actual held time is some amount less
+  // than this. A conservative measurement would have the time capture before the a0_mtx_unlock
+  // call.  The choice of conservative vs liberal measurement here is somewhat arbitrary since
+  // the warning time threshold is roughly chosen to be so high that this distinction should be
+  // meaningless and thus getting warned for actual holds that are close-but-not-over the threshold
+  // is preferable to under-measuring held timings.
+  struct timespec release_monotime;
+  A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &release_monotime), "Failed clock_gettime");
+  a0_warn_if_long_hold(&(lk->lock_monotime), &release_monotime, hdr);
+
   return A0_OK;
 }
 
@@ -321,33 +475,33 @@ errno_t a0_transport_prev(a0_locked_transport_t lk) {
   return A0_OK;
 }
 
-errno_t a0_transport_await(a0_locked_transport_t lk,
+errno_t a0_transport_await(a0_locked_transport_t* lk,
                            errno_t (*pred)(a0_locked_transport_t, bool*)) {
-  if (A0_UNLIKELY(lk.transport->_closing)) {
+  if (A0_UNLIKELY(lk->transport->_closing)) {
     return ESHUTDOWN;
   }
 
   bool sat = false;
-  errno_t err = pred(lk, &sat);
+  errno_t err = pred(*lk, &sat);
   if (err | sat) {
     return err;
   }
 
-  lk.transport->_await_cnt++;
+  lk->transport->_await_cnt++;
 
-  while (A0_LIKELY(!lk.transport->_closing)) {
-    err = pred(lk, &sat);
+  while (A0_LIKELY(!lk->transport->_closing)) {
+    err = pred(*lk, &sat);
     if (err | sat) {
       break;
     }
     a0_wait_for_notify(lk);
   }
-  if (!err && lk.transport->_closing) {
+  if (!err && lk->transport->_closing) {
     err = ESHUTDOWN;
   }
 
-  lk.transport->_await_cnt--;
-  a0_schedule_notify(lk);
+  lk->transport->_await_cnt--;
+  a0_schedule_notify(*lk);
 
   return err;
 }

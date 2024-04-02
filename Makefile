@@ -5,9 +5,9 @@ OBJ_DIR = obj
 LIB_DIR = lib
 BIN_DIR = bin
 
-CXFLAGS += -Wall -Wextra -fPIC -Iinclude
+CXFLAGS += -Wall -Wextra -fPIC -Iinclude -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include
 CXXFLAGS += -std=c++17
-LDFLAGS += -lpthread
+LDFLAGS += -lpthread -lrt -lglib-2.0
 
 SRC_C := $(wildcard $(SRC_DIR)/*.c)
 SRC_CXX := $(wildcard $(SRC_DIR)/*.cpp)
