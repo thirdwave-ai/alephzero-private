@@ -130,6 +130,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -191,6 +192,8 @@ typedef enum a0_transport_init_status_s {
 typedef struct a0_locked_transport_s {
   /// Wrapped transport.
   a0_transport_t* transport;
+  /// Time that the transport lock was acquired from A0_PERF_CLOCK_SOURCE.
+  struct timespec lock_monotime;
 } a0_locked_transport_t;
 
 /// Creates or connects to the transport in the given arena.
@@ -215,7 +218,7 @@ errno_t a0_transport_lock(a0_transport_t*, a0_locked_transport_t* lk_out);
 /// Unlocks the transport.
 ///
 /// The locked_transport object is invalid afterwards.
-errno_t a0_transport_unlock(a0_locked_transport_t);
+errno_t a0_transport_unlock(a0_locked_transport_t*);
 
 /// Accesses the metadata space within the arena.
 ///
@@ -256,7 +259,7 @@ errno_t a0_transport_prev(a0_locked_transport_t);
 /// The predicate is checked when an unlock event occurs following a commit or eviction.
 ///
 /// TODO(lshamis): should pred take user_data?
-errno_t a0_transport_await(a0_locked_transport_t, errno_t (*pred)(a0_locked_transport_t, bool*));
+errno_t a0_transport_await(a0_locked_transport_t*, errno_t (*pred)(a0_locked_transport_t, bool*));
 
 /// Accesses the frame within the arena, at the current transport pointer.
 ///

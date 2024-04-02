@@ -12,7 +12,7 @@ extern "C" {
 
 typedef struct a0_zero_copy_callback_s {
   void* user_data;
-  void (*fn)(void* user_data, a0_locked_transport_t, a0_packet_t);
+  void (*fn)(void* user_data, a0_locked_transport_t*, a0_packet_t);
 } a0_zero_copy_callback_t;
 
 ///////////////

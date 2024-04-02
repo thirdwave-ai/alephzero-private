@@ -54,7 +54,7 @@ errno_t a0_publisher_raw_init(a0_publisher_raw_t* pub, a0_arena_t arena) {
   if (empty) {
     A0_RETURN_ERR_ON_ERR(a0_transport_init_metadata(tlk, sizeof(a0_pubsub_metadata_t)));
   }
-  a0_transport_unlock(tlk);
+  a0_transport_unlock(&tlk);
 
 #ifdef DEBUG
   a0_ref_cnt_inc(arena.ptr);
@@ -195,7 +195,7 @@ errno_t a0_subscriber_sync_zc_init(a0_subscriber_sync_zc_t* sub_sync_zc,
                     arena,
                     &init_status,
                     &tlk);
-  a0_transport_unlock(tlk);
+  a0_transport_unlock(&tlk);
 
 #ifdef DEBUG
   a0_ref_cnt_inc(arena.ptr);
@@ -260,7 +260,7 @@ errno_t a0_subscriber_sync_zc_next(a0_subscriber_sync_zc_t* sub_sync_zc,
   a0_packet_t pkt;
   a0_packet_deserialize(a0::buf(frame), *headers_alloc, &pkt);
 
-  cb.fn(cb.user_data, stlk.tlk, pkt);
+  cb.fn(cb.user_data, &(stlk.tlk), pkt);
   sub_sync_zc->_impl->read_first = true;
 
   return A0_OK;
@@ -318,7 +318,7 @@ errno_t a0_subscriber_sync_next(a0_subscriber_sync_t* sub_sync, a0_packet_t* pkt
   a0_zero_copy_callback_t wrapped_cb = {
       .user_data = &data,
       .fn =
-          [](void* user_data, a0_locked_transport_t, a0_packet_t pkt_zc) {
+          [](void* user_data, a0_locked_transport_t*, a0_packet_t pkt_zc) {
             auto* data = (data_t*)user_data;
             a0_packet_deep_copy(pkt_zc, data->alloc, data->pkt);
           },
@@ -356,9 +356,9 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
     return A0_OK;
   };
 
-  auto handle_pkt = [onmsg](a0_locked_transport_t tlk) {
+  auto handle_pkt = [onmsg](a0_locked_transport_t* tlk) {
     a0_transport_frame_t frame;
-    a0_transport_frame(tlk, &frame);
+    a0_transport_frame(*tlk, &frame);
 
     thread_local a0::scope<a0_alloc_t> headers_alloc = a0::scope_realloc();
 
@@ -368,18 +368,18 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
     onmsg.fn(onmsg.user_data, tlk, pkt);
   };
 
-  auto on_transport_nonempty = [sub_zc, sub_init, handle_pkt](a0_locked_transport_t tlk) {
+  auto on_transport_nonempty = [sub_zc, sub_init, handle_pkt](a0_locked_transport_t* tlk) {
     bool reset = false;
     if (sub_zc->_impl->started_empty) {
       reset = true;
     } else {
       bool ptr_valid;
-      a0_transport_ptr_valid(tlk, &ptr_valid);
+      a0_transport_ptr_valid(*tlk, &ptr_valid);
       reset = !ptr_valid;
     }
 
     if (reset) {
-      a0_transport_jump_head(tlk);
+      a0_transport_jump_head(*tlk);
     }
 
     if (reset || sub_init == A0_INIT_OLDEST || sub_init == A0_INIT_MOST_RECENT) {
@@ -387,11 +387,11 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
     }
   };
 
-  auto on_transport_hasnext = [sub_iter, handle_pkt](a0_locked_transport_t tlk) {
+  auto on_transport_hasnext = [sub_iter, handle_pkt](a0_locked_transport_t* tlk) {
     if (sub_iter == A0_ITER_NEXT) {
-      a0_transport_next(tlk);
+      a0_transport_next(*tlk);
     } else if (sub_iter == A0_ITER_NEWEST) {
-      a0_transport_jump_tail(tlk);
+      a0_transport_jump_tail(*tlk);
     }
 
     handle_pkt(tlk);
@@ -455,7 +455,7 @@ errno_t a0_subscriber_init(a0_subscriber_t* sub,
   a0_zero_copy_callback_t wrapped_onmsg = {
       .user_data = sub->_impl,
       .fn =
-          [](void* data, a0_locked_transport_t tlk, a0_packet_t pkt_zc) {
+          [](void* data, a0_locked_transport_t* tlk, a0_packet_t pkt_zc) {
             auto* impl = (a0_subscriber_impl_t*)data;
             a0_packet_t pkt;
             a0_packet_deep_copy(pkt_zc, impl->alloc, &pkt);

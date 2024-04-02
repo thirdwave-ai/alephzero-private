@@ -54,20 +54,20 @@ struct scoped_transport_lock {
     a0_transport_lock(transport, &tlk);
   }
   ~scoped_transport_lock() {
-    a0_transport_unlock(tlk);
+    a0_transport_unlock(&tlk);
   }
 };
 
 struct scoped_transport_unlock {
   a0_transport_t* transport;
+  a0_locked_transport_t* tlk_ptr;
 
-  explicit scoped_transport_unlock(a0_locked_transport_t tlk)
-      : transport{tlk.transport} {
+  explicit scoped_transport_unlock(a0_locked_transport_t* tlk)
+      : transport{tlk->transport}, tlk_ptr(tlk) {
     a0_transport_unlock(tlk);
   }
   ~scoped_transport_unlock() {
-    a0_locked_transport_t tlk;
-    a0_transport_lock(transport, &tlk);
+    a0_transport_lock(transport, tlk_ptr);
   }
 };
 
@@ -76,15 +76,15 @@ struct transport_thread {
     a0_transport_t transport;
     std::thread::id t_id;
 
-    std::function<void(a0_locked_transport_t)> on_transport_nonempty;
-    std::function<void(a0_locked_transport_t)> on_transport_hasnext;
+    std::function<void(a0_locked_transport_t*)> on_transport_nonempty;
+    std::function<void(a0_locked_transport_t*)> on_transport_hasnext;
 
     a0::sync<std::function<void()>> onclose;
 
     bool handle_first_pkt() {
       scoped_transport_lock stlk(&transport);
-      if (a0_transport_await(stlk.tlk, a0_transport_nonempty) == A0_OK) {
-        on_transport_nonempty(stlk.tlk);
+      if (a0_transport_await(&(stlk.tlk), a0_transport_nonempty) == A0_OK) {
+        on_transport_nonempty(&(stlk.tlk));
         return true;
       }
       return false;
@@ -92,8 +92,8 @@ struct transport_thread {
 
     bool handle_next_pkt() {
       scoped_transport_lock stlk(&transport);
-      if (a0_transport_await(stlk.tlk, a0_transport_has_next) == A0_OK) {
-        on_transport_hasnext(stlk.tlk);
+      if (a0_transport_await(&(stlk.tlk), a0_transport_has_next) == A0_OK) {
+        on_transport_hasnext(&(stlk.tlk));
         return true;
       }
       return false;
@@ -118,8 +118,8 @@ struct transport_thread {
   errno_t init(
       a0_arena_t arena,
       const std::function<errno_t(a0_locked_transport_t, a0_transport_init_status_t)>& on_transport_init,
-      std::function<void(a0_locked_transport_t)> on_transport_nonempty,
-      std::function<void(a0_locked_transport_t)> on_transport_hasnext) {
+      std::function<void(a0_locked_transport_t*)> on_transport_nonempty,
+      std::function<void(a0_locked_transport_t*)> on_transport_hasnext) {
     state = std::make_shared<state_t>();
     state->on_transport_nonempty = std::move(on_transport_nonempty);
     state->on_transport_hasnext = std::move(on_transport_hasnext);
@@ -128,7 +128,7 @@ struct transport_thread {
     a0_locked_transport_t tlk;
     a0_transport_init(&state->transport, arena, &init_status, &tlk);
     errno_t err = on_transport_init(tlk, init_status);
-    a0_transport_unlock(tlk);
+    a0_transport_unlock(&tlk);
     if (err) {
       return err;
     }
