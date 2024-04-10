@@ -180,6 +180,36 @@ errno_t a0_transport_close(a0_transport_t* transport) {
 
   a0_transport_unlock(&lk);
 
+  // Evict the arena from our logging cache if it exists.
+  // Grab the hashmap lock.
+  errno_t lock_status = a0_mtx_lock(&a0_global_reverse_mmap_mu);
+  if (A0_UNLIKELY(lock_status == EOWNERDEAD)) {
+    lock_status = a0_mtx_consistent(&a0_global_reverse_mmap_mu);
+  }
+
+  // Hashmap initialization isn't guaranteed. If no timing checks
+  // ever failed, we may have never even constructed an initial
+  // hashmap.
+  if (a0_global_reverse_mmap) {
+    a0_transport_hdr_t* arena = (a0_transport_hdr_t*)transport->_arena.ptr;
+    // If no timing check for this transport ever failed, then we don't expect
+    // to find the value in the map. g_hash_table_remove does the right thing
+    // whether or not the key is found.  It returns a bool indicating whether
+    // it actually removed anything which we don't check because both values
+    // are valid.
+    g_hash_table_remove(a0_global_reverse_mmap, arena);
+
+    // If we're down to zero elements, clean up the entire hashmap.
+    // A new hashmap will be created if needed at the next timing
+    // warning point.
+    if (0 == g_hash_table_size(a0_global_reverse_mmap)) {
+      // This frees all the hashmap memory.
+      g_hash_table_unref(a0_global_reverse_mmap);
+      a0_global_reverse_mmap = NULL;
+    }
+  }
+  a0_mtx_unlock(&a0_global_reverse_mmap_mu);
+
   return A0_OK;
 }
 
@@ -190,21 +220,16 @@ errno_t a0_transport_close(a0_transport_t* transport) {
 // a problem reading the memory map. Returns "" if the address is not
 // backed by a mmapped file-like object.
 //
+// The returned string is owned by the a0 global cache and is good for
+// the lifetime of the transport (i.e. until a0_transport_close())
+//
 // This function attempts to cache its results in a global cache to
 // enable fast return. Otherwise it parses the process /proc/self/maps
 // file to determine the mmap status.
 //
 // This function is threadsafe.
-//
-// Note: This cache currently has no invalidation or eviction policy.
 A0_STATIC_INLINE
 char* a0_reverse_map_arena_to_path(a0_transport_hdr_t* arena) {
-  // Note: This allocates a hash table and all the values and
-  // makes no attempt to clean any of it up. This memory is intended
-  // to live for the life of the program and thus freeing is not a priority.
-  // This is only valid if the assumption that transports are rarely
-  // destroyed holds.
-
   // Lock the memory map.
   errno_t lock_status = a0_mtx_lock(&a0_global_reverse_mmap_mu);
   if (A0_UNLIKELY(lock_status == EOWNERDEAD)) {
@@ -212,7 +237,12 @@ char* a0_reverse_map_arena_to_path(a0_transport_hdr_t* arena) {
   }
 
   if (a0_global_reverse_mmap == NULL) {
-    a0_global_reverse_mmap = g_hash_table_new(NULL, NULL);
+    // Initializes the map.
+    a0_global_reverse_mmap = g_hash_table_new_full(
+        NULL,  // passthrough hash function (g_direct_hash).
+        NULL,  // standard key equality function (g_direct_equal).
+        NULL,  // No key destruction function.
+        free); // Values are allocated and need to be freed.
   }
   char* maybe_path = g_hash_table_lookup(a0_global_reverse_mmap, arena);
   if (maybe_path) {
@@ -245,15 +275,15 @@ char* a0_reverse_map_arena_to_path(a0_transport_hdr_t* arena) {
   // version of unknown, since the transport might be in-memory for test purposes
   // and we don't want to continually scan the memory map.
 
-  // Note: this string allocation has no associated free. This cache currently
-  // persists for the life of the program.
   char* result = strdup(pathname);
   g_hash_table_insert(a0_global_reverse_mmap, arena, result);
+  a0_mtx_unlock(&a0_global_reverse_mmap_mu);
 
-  // Clean up the parser. Needs to be done after the pathname dup.
+  // Clean up the parser. Needs to be done after the pathname dup. Done
+  // after mutex unlock to keep lock time as short as possible, though
+  // there is no evidence that this free is expensive at all.
   pmparser_free(pmparse);
 
-  a0_mtx_unlock(&a0_global_reverse_mmap_mu);
   return result;
 }
 
