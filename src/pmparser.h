@@ -24,6 +24,10 @@ implied warranty.
 #include <errno.h>
 #include <linux/limits.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 //maximum line length in a procmaps file
 #define PROCMAPS_LINE_MAX_LENGTH  (PATH_MAX + 100) 
 /**
@@ -92,8 +96,8 @@ void _pmparser_split_line(char*buf,char*addr1,char*addr2,char*perm, char* offset
  */
 void pmparser_print(procmaps_struct* map,int order);
 
-
-
-
+#ifdef __cplusplus
+}  // extern C
+#endif
 
 #endif
