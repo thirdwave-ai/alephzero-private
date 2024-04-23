@@ -33,6 +33,8 @@ procmaps_iterator* pmparser_parse(int pid){
 	procmaps_struct* current_node=list_maps;
 	char addr1[20],addr2[20], perm[8], offset[20], dev[10],inode[30],pathname[PATH_MAX];
 	while( !feof(file) ){
+		// Clear errno so we can test its value correctly after fgets.
+		errno = 0;
 		if (fgets(buf,PROCMAPS_LINE_MAX_LENGTH,file) == NULL){
 			if (errno == EAGAIN) {
 				continue;
