@@ -122,7 +122,7 @@ TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] pkt") {
   REQUIRE(pkt.payload() == pkt_view.payload());
   REQUIRE(pkt.payload().data() == pkt_view.payload().data());
 
-  a0::Packet pkt2 = pkt_view;
+  a0::Packet pkt2 = a0::Packet(pkt_view);
   REQUIRE(pkt2.id() == pkt_view.id());
   REQUIRE(pkt.id() == pkt2.id());
   REQUIRE(pkt.headers() == pkt2.headers());

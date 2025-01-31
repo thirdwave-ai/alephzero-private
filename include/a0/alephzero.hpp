@@ -135,11 +135,13 @@ struct Packet : details::CppWrap<a0_packet_t> {
   Packet(std::vector<std::pair<std::string, std::string>> headers,
          std::string payload);
 
+  /// Keep these explicit to avoid invisible copies.
+  ///
   /// Create a deep copy of the given PacketView.
-  Packet(const PacketView&);
+  explicit Packet(const PacketView&);
   /// Create a deep copy of the given PacketView.
-  Packet(PacketView&&);
-  Packet(a0_packet_t);
+  explicit Packet(PacketView&&);
+  explicit Packet(a0_packet_t);
 
   /// Packet unique identifier.
   std::string_view id() const;
