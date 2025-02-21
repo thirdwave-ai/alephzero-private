@@ -33,6 +33,10 @@
 #define A0_PERF_CLOCK_SOURCE CLOCK_MONOTONIC_COARSE
 // Warn for any allocations taking more than 5ms
 #define A0_ALLOC_WARN_NS 5000000
+// Warn for any transport manipulations taking more than 20ms
+#define A0_MANIP_WARN_NS 20000000
+// Warn for any transport packet handlers taking more than 100ms
+#define A0_HANDLER_WARN_NS 100000000
 
 namespace {
 
@@ -419,13 +423,21 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
   };
 
   auto on_transport_hasnext = [sub_iter, handle_pkt](a0_locked_transport_t* tlk) {
+    struct timespec start_transport_manip;
+    struct timespec end_transport_manip;
+    struct timespec end_handler;
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_transport_manip), "Failed clock_gettime");
     if (sub_iter == A0_ITER_NEXT) {
       a0_transport_next(*tlk);
     } else if (sub_iter == A0_ITER_NEWEST) {
       a0_transport_jump_tail(*tlk);
     }
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_transport_manip), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&start_transport_manip, &end_transport_manip, A0_MANIP_WARN_NS, "transport_hasnext manip");
 
     handle_pkt(tlk);
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_handler), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&end_transport_manip, &end_handler, A0_HANDLER_WARN_NS, "transport_hasnext handler");
   };
 
   return sub_zc->_impl->worker.init(arena,
