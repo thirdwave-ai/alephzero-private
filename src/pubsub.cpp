@@ -27,11 +27,41 @@
 #include "ref_cnt.h"
 #endif
 
+// Use MONOTONIC_COARSE to avoid syscall cost at the expense of reduced resolution.
+// On our systems, the coarse clock has a 4ms resolution, which is still good enough
+// for >200Hz timings.
+#define A0_PERF_CLOCK_SOURCE CLOCK_MONOTONIC_COARSE
+// Warn for any allocations taking more than 5ms
+#define A0_ALLOC_WARN_NS 5000000
+// Warn for any transport manipulations taking more than 20ms
+#define A0_MANIP_WARN_NS 20000000
+// Warn for any transport packet handlers taking more than 100ms
+#define A0_HANDLER_WARN_NS 100000000
+
 namespace {
 
 struct a0_pubsub_metadata_t {
   uint64_t transport_seq;
 };
+
+// Given a start time and end time, check to see if the timedelta is > the given
+// threshold (a number of nanoseconds).
+// If so:
+//  * Emit a warning message on stderr with the @p preamble and
+//    the measured and threshold timings.
+// If not:
+//  * Do nothing and return.
+A0_STATIC_INLINE
+void a0_warn_if_past_threshold(struct timespec* start, struct timespec* end, int64_t threshold_ns,
+                               const char* preamble) {
+  int64_t seconds = end->tv_sec - start->tv_sec;
+  int64_t nanoseconds = (seconds * 1000000000) + (end->tv_nsec - start->tv_nsec);
+
+  if (A0_UNLIKELY(nanoseconds > threshold_ns) && (threshold_ns != 0)) {
+    const double kMsPerNs = 1e-6;
+    fprintf(stderr, "Warning: %s %.3fms. Above threshold of %.3fms\n", preamble, nanoseconds * kMsPerNs, threshold_ns * kMsPerNs);
+  }
+}
 
 };  // namespace
 
@@ -320,7 +350,12 @@ errno_t a0_subscriber_sync_next(a0_subscriber_sync_t* sub_sync, a0_packet_t* pkt
       .fn =
           [](void* user_data, a0_locked_transport_t*, a0_packet_t pkt_zc) {
             auto* data = (data_t*)user_data;
+            struct timespec start_copy;
+            struct timespec end_copy;
+            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_copy), "Failed clock_gettime");
             a0_packet_deep_copy(pkt_zc, data->alloc, data->pkt);
+            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_copy), "Failed clock_gettime");
+            a0_warn_if_past_threshold(&start_copy, &end_copy, A0_ALLOC_WARN_NS, "sub_sync_next allocation");
           },
   };
   return a0_subscriber_sync_zc_next(&sub_sync->_impl->sub_sync_zc, wrapped_cb);
@@ -388,13 +423,21 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
   };
 
   auto on_transport_hasnext = [sub_iter, handle_pkt](a0_locked_transport_t* tlk) {
+    struct timespec start_transport_manip;
+    struct timespec end_transport_manip;
+    struct timespec end_handler;
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_transport_manip), "Failed clock_gettime");
     if (sub_iter == A0_ITER_NEXT) {
       a0_transport_next(*tlk);
     } else if (sub_iter == A0_ITER_NEWEST) {
       a0_transport_jump_tail(*tlk);
     }
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_transport_manip), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&start_transport_manip, &end_transport_manip, A0_MANIP_WARN_NS, "transport_hasnext manip");
 
     handle_pkt(tlk);
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_handler), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&end_transport_manip, &end_handler, A0_HANDLER_WARN_NS, "transport_hasnext handler");
   };
 
   return sub_zc->_impl->worker.init(arena,
@@ -456,9 +499,14 @@ errno_t a0_subscriber_init(a0_subscriber_t* sub,
       .user_data = sub->_impl,
       .fn =
           [](void* data, a0_locked_transport_t* tlk, a0_packet_t pkt_zc) {
+            struct timespec start_copy;
+            struct timespec end_copy;
+            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_copy), "Failed clock_gettime");
             auto* impl = (a0_subscriber_impl_t*)data;
             a0_packet_t pkt;
             a0_packet_deep_copy(pkt_zc, impl->alloc, &pkt);
+            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_copy), "Failed clock_gettime");
+            a0_warn_if_past_threshold(&start_copy, &end_copy, A0_ALLOC_WARN_NS, "sub_callback allocation");
 
             a0::scoped_transport_unlock stulk(tlk);
             impl->onmsg.fn(impl->onmsg.user_data, pkt);
