@@ -283,6 +283,23 @@ errno_t a0_transport_commit(a0_locked_transport_t);
 /// Clears the transport. Evicts all frames.
 errno_t a0_transport_clear(a0_locked_transport_t);
 
+/// Returns the current seqlock counter (always even = no write in progress).
+/// Spins briefly if a write is in progress.  Used together with
+/// a0_transport_seqcount_valid to perform lock-free frame-data copies:
+///
+///   uint32_t seq;
+///   do {
+///     seq = a0_transport_seqcount(transport);
+///     memcpy(dst, frame.data, frame.hdr.data_size);
+///   } while (!a0_transport_seqcount_valid(transport, seq));
+///
+/// Must be called WITHOUT holding the transport lock.
+uint32_t a0_transport_seqcount(a0_transport_t*);
+
+/// Returns true if no write was committed since the seqcount was obtained.
+/// If false, the caller must discard its copy and retry.
+bool a0_transport_seqcount_valid(a0_transport_t*, uint32_t expected);
+
 /** @}*/
 
 #ifdef __cplusplus

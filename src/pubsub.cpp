@@ -413,14 +413,41 @@ errno_t a0_subscriber_zc_init(a0_subscriber_zc_t* sub_zc,
   };
 
   auto handle_pkt = [onmsg](a0_locked_transport_t* tlk) {
+    // Read the frame pointer while holding the transport lock.  frame.data is
+    // a pointer into the arena (persistent shared memory); frame.hdr contains
+    // the frame header fields including offset and data_size.
     a0_transport_frame_t frame;
     a0_transport_frame(*tlk, &frame);
 
+    // Release the transport lock immediately after obtaining the frame
+    // pointer.  This allows publishers and other subscribers to proceed
+    // without waiting for the memcpy or the user callback.  We use a seqlock
+    // to detect if a concurrent commit overwrites this frame's arena slot
+    // while we are copying.
+    a0_transport_unlock(tlk);
+
+    thread_local std::vector<uint8_t> frame_bytes;
+    uint32_t seq;
+    do {
+      seq = a0_transport_seqcount(tlk->transport);
+      // Re-read data_size each iteration: if this slot was evicted and reused
+      // by a newer frame, data_size may have changed.  The seqlock end-check
+      // validates that both data_size and the copied bytes are consistent.
+      const auto* fhdr = reinterpret_cast<const a0_transport_frame_hdr_t*>(
+          static_cast<const uint8_t*>(tlk->transport->_arena.ptr) + frame.hdr.off);
+      frame_bytes.resize(static_cast<size_t>(fhdr->data_size));
+      memcpy(frame_bytes.data(), frame.data, frame_bytes.size());
+    } while (!a0_transport_seqcount_valid(tlk->transport, seq));
+
+    // Deserialize entirely outside the lock.
     thread_local a0::scope<a0_alloc_t> headers_alloc = a0::scope_realloc();
-
+    a0_buf_t local_buf = {frame_bytes.data(), frame_bytes.size()};
     a0_packet_t pkt;
-    a0_packet_deserialize(a0::buf(frame), *headers_alloc, &pkt);
+    a0_packet_deserialize(local_buf, *headers_alloc, &pkt);
 
+    // Re-acquire the transport lock before invoking the zero-copy callback:
+    // the a0_zero_copy_callback_t contract requires a valid locked transport.
+    a0_transport_lock(tlk->transport, tlk);
     onmsg.fn(onmsg.user_data, tlk, pkt);
   };
 
@@ -519,31 +546,24 @@ errno_t a0_subscriber_init(a0_subscriber_t* sub,
   a0_zero_copy_callback_t wrapped_onmsg = {
       .user_data = sub->_impl,
       .fn =
-          [](void* data, a0_locked_transport_t* tlk, a0_packet_t /*pkt_zc*/) {
+          [](void* data, a0_locked_transport_t* tlk, a0_packet_t pkt_zc) {
             auto* impl = (a0_subscriber_impl_t*)data;
-            // While holding the transport lock, copy the raw serialized frame
-            // bytes to a thread-local buffer (fast, bounded memcpy). Then release
-            // the lock before calling impl->alloc. Calling malloc under the
-            // transport lock causes every other subscriber and publisher to stall
-            // for the full duration of the allocation (heap contention, page
-            // faults, fragmentation, etc.).
-            a0_transport_frame_t raw_frame;
-            a0_transport_frame(*tlk, &raw_frame);
-            thread_local std::vector<uint8_t> local_frame_bytes;
-            local_frame_bytes.resize(raw_frame.hdr.data_size);
-            memcpy(local_frame_bytes.data(), raw_frame.data, raw_frame.hdr.data_size);
-            // Release lock before allocating; re-acquired when stulk destructs.
+            // handle_pkt (in a0_subscriber_zc_init) already copied the raw
+            // frame bytes from shared memory via seqlock and deserialized them
+            // into pkt_zc — all outside the transport lock.  pkt_zc header
+            // strings and payload point into thread-local buffers that remain
+            // valid for the lifetime of this synchronous callback.
+            //
+            // Still release the transport lock around deep_copy: impl->alloc
+            // may call malloc, and holding hdr->mu across a heap allocation
+            // stalls all other publishers and subscribers.
             a0::scoped_transport_unlock stulk(tlk);
 
             struct timespec start_copy;
             struct timespec end_copy;
             A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_copy), "Failed clock_gettime");
-            a0_buf_t local_buf = {local_frame_bytes.data(), local_frame_bytes.size()};
-            thread_local a0::scope<a0_alloc_t> local_headers_alloc = a0::scope_realloc();
-            a0_packet_t pkt_local;
-            a0_packet_deserialize(local_buf, *local_headers_alloc, &pkt_local);
             a0_packet_t pkt;
-            a0_packet_deep_copy(pkt_local, impl->alloc, &pkt);
+            a0_packet_deep_copy(pkt_zc, impl->alloc, &pkt);
             A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_copy), "Failed clock_gettime");
             a0_warn_if_past_threshold(&start_copy, &end_copy, A0_ALLOC_WARN_NS, "sub_callback allocation");
 

@@ -862,6 +862,33 @@ bool a0_transport_seqlock_read_end(a0_transport_t* transport, uint32_t expected_
   return __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE) == expected_seq;
 }
 
+// ---- Public seqlock helpers (no internal types exposed) ----
+
+// Returns the current seqcount value (always even on return).  Spins briefly
+// if a commit is in progress.  Used by subscribers to bracket a lock-free
+// frame-data copy: call this before the memcpy, then validate with
+// a0_transport_seqcount_valid after the memcpy.
+uint32_t a0_transport_seqcount(a0_transport_t* transport) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)transport->_arena.ptr;
+  while (true) {
+    uint32_t seq = __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE);
+    if (A0_UNLIKELY(seq & 1)) {
+      a0_spin();
+      continue;
+    }
+    return seq;
+  }
+}
+
+// Returns true if no write was committed to the transport since expected_seq
+// was obtained from a0_transport_seqcount.  Returns false if a concurrent
+// commit occurred; in that case the caller must discard its copied data and
+// retry from a0_transport_seqcount.
+bool a0_transport_seqcount_valid(a0_transport_t* transport, uint32_t expected_seq) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)transport->_arena.ptr;
+  return __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE) == expected_seq;
+}
+
 errno_t a0_transport_clear(a0_locked_transport_t lk) {
   a0_transport_state_t* state = a0_transport_working_page(lk);
   // Reset sequence numbers to 0 so the next allocation restarts from 1.
