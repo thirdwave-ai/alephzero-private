@@ -780,7 +780,13 @@ errno_t a0_transport_commit(a0_locked_transport_t lk) {
 
 errno_t a0_transport_clear(a0_locked_transport_t lk) {
   a0_transport_state_t* state = a0_transport_working_page(lk);
-  state->seq_low = state->seq_high + 1;
+  // Reset sequence numbers to 0 so the next allocation restarts from 1.
+  // Resetting seq_high to 0 satisfies the empty invariant via the
+  // !seq_high branch in a0_transport_empty, avoiding any overflow
+  // issue that would arise from seq_low = seq_high + 1 when
+  // seq_high == UINT64_MAX.
+  state->seq_low = 0;
+  state->seq_high = 0;
   state->off_head = 0;
   state->off_tail = 0;
   return a0_transport_commit(lk);
