@@ -636,13 +636,40 @@ errno_t a0_transport_find_slot(a0_locked_transport_t lk, size_t frame_size, tran
 }
 
 A0_STATIC_INLINE
-void a0_transport_evict(a0_locked_transport_t lk, transport_off_t off, size_t frame_size) {
+bool a0_transport_slot_evicts(a0_locked_transport_t lk, transport_off_t off, size_t frame_size) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk.transport->_arena.ptr;
+  a0_transport_state_t* state = a0_transport_working_page(lk);
+
   transport_off_t head_off;
   size_t head_size;
+
+  // If there is no head element, there is nothing to evict.
+  if (!a0_transport_head_interval(lk, state, &head_off, &head_size)) {
+    return false;
+  }
+
+  // If we intersect with the head element, we should evict it.
+  if (a0_transport_frame_intersects(off, frame_size, head_off, head_size)) {
+    return true;
+  }
+
+  // If tail element is behind the head element (i.e., our buffer wraps around),
+  // and the new element is slotted for the beginning of the workspace
+  // then there are old elements near the end of the workspace that need removal.
+  if (state->off_tail < state->off_head && off == a0_transport_workspace_off(hdr)) {
+    return true;
+  }
+
+  // No reason left to evict.
+  return false;
+}
+
+A0_STATIC_INLINE
+void a0_transport_evict(a0_locked_transport_t lk, transport_off_t off, size_t frame_size) {
   a0_transport_state_t* state = a0_transport_working_page(lk);
-  while (a0_transport_head_interval(lk, state, &head_off, &head_size) &&
-         a0_transport_frame_intersects(off, frame_size, head_off, head_size)) {
+  while (a0_transport_slot_evicts(lk, off, frame_size)) {
     a0_transport_remove_head(lk, state);
+    state = a0_transport_working_page(lk);
   }
 }
 
@@ -690,11 +717,7 @@ errno_t a0_transport_alloc_evicts(a0_locked_transport_t lk, size_t size, bool* o
   transport_off_t off;
   A0_RETURN_ERR_ON_ERR(a0_transport_find_slot(lk, frame_size, &off));
 
-  transport_off_t head_off;
-  size_t head_size;
-  a0_transport_state_t* state = a0_transport_working_page(lk);
-  *out = a0_transport_head_interval(lk, state, &head_off, &head_size) &&
-         a0_transport_frame_intersects(off, frame_size, head_off, head_size);
+  *out = a0_transport_slot_evicts(lk, off, frame_size);
 
   return A0_OK;
 }
@@ -753,6 +776,14 @@ errno_t a0_transport_commit(a0_locked_transport_t lk) {
   a0_schedule_notify(lk);
 
   return A0_OK;
+}
+
+errno_t a0_transport_clear(a0_locked_transport_t lk) {
+  a0_transport_state_t* state = a0_transport_working_page(lk);
+  state->seq_low = state->seq_high + 1;
+  state->off_head = 0;
+  state->off_tail = 0;
+  return a0_transport_commit(lk);
 }
 
 A0_STATIC_INLINE
