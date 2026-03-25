@@ -49,8 +49,25 @@ typedef struct a0_transport_hdr_s {
 
   a0_mtx_t mu;
 
+  // Monotonically increasing generation counter used by subscribers waiting
+  // for new data.  Incremented (and broadcasted) on every notifiable commit.
+  // All waiters sleep on the current value; all wake together when it changes.
   a0_ftx_t ftxcv;
-  uint32_t next_ftxcv_tkn;
+
+  // Seqlock counter for lock-free reads of committed state.
+  //
+  // Even  = committed state is stable; safe for lock-free readers to snapshot.
+  // Odd   = a commit is in progress; lock-free readers must spin and retry.
+  //
+  // Writers (inside a0_transport_commit) bracket the page-flip with
+  // seqcount++ (→ odd) ... seqcount++ (→ even).
+  //
+  // Readers use a0_transport_seqlock_read_begin / _end to obtain a consistent
+  // snapshot of the committed state without acquiring hdr->mu.
+  //
+  // Previously named next_ftxcv_tkn; same field position and type.
+  uint32_t seqcount;
+
   bool has_notify_listener;
 
   a0_transport_state_t state_pages[2];
@@ -153,12 +170,16 @@ A0_STATIC_INLINE
 void a0_wait_for_notify(a0_locked_transport_t* lk) {
   a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk->transport->_arena.ptr;
 
-  uint32_t key = lk->transport->_lk_tkn;
-  hdr->ftxcv = key;
+  // Snapshot the current notification generation.  Do NOT overwrite ftxcv
+  // with a per-lock token.  With N subscribers each writing their own token,
+  // every subscriber would see ftxcv != their_token and spin in EAGAIN,
+  // creating a busy-loop.  Instead, all subscribers read the same value and
+  // sleep until the publisher increments it, waking everyone simultaneously.
+  uint32_t seq = hdr->ftxcv;
   hdr->has_notify_listener = true;
 
   a0_transport_unlock(lk);
-  a0_ftx_wait(&hdr->ftxcv, key, NULL);
+  a0_ftx_wait(&hdr->ftxcv, seq, NULL);
   a0_transport_lock(lk->transport, lk);
 }
 
@@ -347,11 +368,9 @@ errno_t a0_transport_lock(a0_transport_t* transport, a0_locked_transport_t* lk_o
     a0_schedule_notify(*lk_out);
   }
 
-  // Measure lock aquisition time and warn if necessary.
+  // Measure lock acquisition time and warn if necessary.
   A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &(lk_out->lock_monotime)), "Failed clock_gettime");
   a0_warn_if_long_acquire(&start_acquire, &(lk_out->lock_monotime), hdr);
-
-  lk_out->transport->_lk_tkn = a0_atomic_inc_fetch(&hdr->next_ftxcv_tkn);
 
   // Clear any incomplete changes.
   *a0_transport_working_page(*lk_out) = *a0_transport_committed_page(*lk_out);
@@ -364,12 +383,12 @@ errno_t a0_transport_unlock(a0_locked_transport_t* lk) {
   *a0_transport_working_page(*lk) = *a0_transport_committed_page(*lk);
   a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk->transport->_arena.ptr;
   if (hdr->has_notify_listener && lk->transport->_should_notify) {
-    // wait_for_notify unlocks (using this function) before starting the futex_wait.
-    // In all other cases, futex_broadcast should clear has_notify_listener.
-    // The following line effectively checks whether the unlock is part of wait_for_notify.
-    // TODO(lshamis): This code is piped weird and should be cleaned up.
-    hdr->has_notify_listener = (hdr->ftxcv == lk->transport->_lk_tkn);
-    hdr->ftxcv = lk->transport->_lk_tkn;
+    // Increment the notification generation and wake all waiters.
+    // All subscribers sleep on the same ftxcv value (their snapshot from
+    // a0_wait_for_notify), so a single broadcast wakes them all simultaneously
+    // with no busy-looping between them.
+    hdr->has_notify_listener = false;
+    hdr->ftxcv++;
     a0_ftx_broadcast(&hdr->ftxcv);
   }
   a0_mtx_unlock(&hdr->mu);
@@ -765,6 +784,10 @@ errno_t a0_transport_allocator(a0_locked_transport_t* lk, a0_alloc_t* alloc_out)
 
 errno_t a0_transport_commit(a0_locked_transport_t lk) {
   a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)lk.transport->_arena.ptr;
+  // Seqlock write-begin: signal to concurrently-reading subscribers that a
+  // commit is in progress.  Odd value means "write in progress; retry read".
+  a0_atomic_add_fetch(&hdr->seqcount, 1);
+  a0_barrier();
   // Assume page A was the previously committed page and page B is the working
   // page that is ready to be committed. Both represent a valid state for the
   // transport. It's possible that the copying of B into A will fail (prog crash),
@@ -772,10 +795,71 @@ errno_t a0_transport_commit(a0_locked_transport_t lk) {
   // copying the page info.
   hdr->committed_page_idx = !hdr->committed_page_idx;
   *a0_transport_working_page(lk) = *a0_transport_committed_page(lk);
+  a0_barrier();
+  // Seqlock write-end: committed state is stable again (even value).
+  // Lock-free readers that observed the odd value will retry and now see a
+  // consistent snapshot.
+  a0_atomic_add_fetch(&hdr->seqcount, 1);
 
   a0_schedule_notify(lk);
 
   return A0_OK;
+}
+
+// ---- Seqlock read path (lock-free, no mutex acquisition) ----
+//
+// Subscribers that only need to observe committed state (seq_low/seq_high,
+// frame offsets, frame data) can bypass hdr->mu entirely, allowing N readers
+// to proceed simultaneously without serializing behind the writer.
+//
+// Typical usage:
+//
+//   a0_transport_state_t snap;
+//   uint32_t seq;
+//   do {
+//     seq = a0_transport_seqlock_read_begin(transport, &snap);
+//     /*
+//      * Use snap.seq_low/seq_high/off_head/off_tail and any frame data
+//      * pointed to by offsets within transport->_arena.  Access is safe
+//      * as long as seqlock_read_end returns true.
+//      */
+//   } while (!a0_transport_seqlock_read_end(transport, seq));
+//
+// Note: seqlock reads are optimistic.  They never block, but they may
+// spin briefly if a concurrent commit is in progress.  Callers that need
+// to WAIT for new data (i.e., the transport is currently empty) must still
+// fall back to acquiring the mutex and calling a0_transport_await.
+
+// Returns the current (even) seqcount and a consistent snapshot of the
+// committed transport state.  Spins until any in-progress commit finishes.
+A0_STATIC_INLINE
+uint32_t a0_transport_seqlock_read_begin(a0_transport_t* transport,
+                                         a0_transport_state_t* snap) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)transport->_arena.ptr;
+  while (true) {
+    uint32_t seq = __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE);
+    if (A0_UNLIKELY(seq & 1)) {
+      a0_spin();  // commit in progress; wait for it to finish
+      continue;
+    }
+    *snap = hdr->state_pages[hdr->committed_page_idx];
+    // Acquire fence ensures subsequent reads of arena frame data see the
+    // writes that were committed before the seqcount we sampled.
+    uint32_t seq2 = __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE);
+    if (A0_LIKELY(seq == seq2)) {
+      return seq;
+    }
+    // A concurrent commit landed between our two seqcount reads; retry.
+  }
+}
+
+// Returns true if the snapshot obtained via a0_transport_seqlock_read_begin
+// is still valid (no concurrent commit occurred since).  If false, the caller
+// must discard any data read from the arena and retry from begin.
+A0_STATIC_INLINE
+bool a0_transport_seqlock_read_end(a0_transport_t* transport, uint32_t expected_seq) {
+  a0_transport_hdr_t* hdr = (a0_transport_hdr_t*)transport->_arena.ptr;
+  return __atomic_load_n(&hdr->seqcount, __ATOMIC_ACQUIRE) == expected_seq;
 }
 
 errno_t a0_transport_clear(a0_locked_transport_t lk) {

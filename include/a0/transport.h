@@ -156,9 +156,6 @@ typedef struct a0_transport_s {
 
   // Whether the transport has an unflushed notification.
   bool _should_notify;
-
-  // Unique token used to distinguish locks.
-  uint32_t _lk_tkn;
 } a0_transport_t;
 
 typedef struct a0_transport_frame_hdr_s {
