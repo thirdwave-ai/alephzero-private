@@ -283,6 +283,8 @@ errno_t a0_transport_alloc(a0_locked_transport_t, size_t, a0_transport_frame_t* 
 errno_t a0_transport_alloc_evicts(a0_locked_transport_t, size_t, bool*);
 errno_t a0_transport_allocator(a0_locked_transport_t*, a0_alloc_t*);
 errno_t a0_transport_commit(a0_locked_transport_t);
+/// Clears the transport. Evicts all frames.
+errno_t a0_transport_clear(a0_locked_transport_t);
 
 /** @}*/
 
