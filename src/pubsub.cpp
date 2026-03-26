@@ -526,11 +526,25 @@ errno_t a0_subscriber_zc_close(a0_subscriber_zc_t* sub_zc) {
 // Normal threaded version.
 
 struct a0_subscriber_impl_s {
-  a0_subscriber_zc_t sub_zc;
+  // Worker thread is owned directly rather than via a0_subscriber_zc_t.
+  // This allows handle_pkt to use a two-phase lock protocol (one acquire/
+  // release pair per message) instead of the three pairs required when going
+  // through the ZC callback API.
+  a0::transport_thread worker;
+  bool started_empty;
 
   a0_alloc_t alloc;
   a0_packet_callback_t onmsg;
 };
+
+// Frame data smaller than this threshold is copied while the transport lock is
+// held.  Larger frames use a seqlock-protected copy (unlock → copy → re-acquire)
+// so the lock hold is bounded regardless of message size.
+//
+// Rationale: one PI-futex round-trip costs ~2 µs uncontended.  At ~10 GB/s
+// memcpy bandwidth, a 16 kB frame takes ~1.5 µs to copy.  Below ~16 kB the
+// extra lock round-trip is not worth the parallelism it buys.
+static constexpr size_t A0_SUB_SEQLOCK_COPY_THRESHOLD = 16 * 1024;  // 16 kB
 
 errno_t a0_subscriber_init(a0_subscriber_t* sub,
                            a0_arena_t arena,
@@ -539,39 +553,129 @@ errno_t a0_subscriber_init(a0_subscriber_t* sub,
                            a0_subscriber_iter_t sub_iter,
                            a0_packet_callback_t onmsg) {
   sub->_impl = new a0_subscriber_impl_t;
-
   sub->_impl->alloc = alloc;
   sub->_impl->onmsg = onmsg;
 
-  a0_zero_copy_callback_t wrapped_onmsg = {
-      .user_data = sub->_impl,
-      .fn =
-          [](void* data, a0_locked_transport_t* tlk, a0_packet_t pkt_zc) {
-            auto* impl = (a0_subscriber_impl_t*)data;
-            // handle_pkt (in a0_subscriber_zc_init) already copied the raw
-            // frame bytes from shared memory via seqlock and deserialized them
-            // into pkt_zc — all outside the transport lock.  pkt_zc header
-            // strings and payload point into thread-local buffers that remain
-            // valid for the lifetime of this synchronous callback.
-            //
-            // Still release the transport lock around deep_copy: impl->alloc
-            // may call malloc, and holding hdr->mu across a heap allocation
-            // stalls all other publishers and subscribers.
-            a0::scoped_transport_unlock stulk(tlk);
+  // Optimised packet handler for the non-ZC subscriber path.
+  //
+  // Lock protocol per message (2 acquires, 2 releases):
+  //   [caller holds lock]
+  //   Small frame: advance + memcpy under lock → unlock once → deep_copy +
+  //       user_callback outside lock → re-acquire before returning.
+  //   Large frame: advance under lock → unlock → seqlock memcpy → deep_copy +
+  //       user_callback outside lock → re-acquire before returning.
+  //
+  // This eliminates the unnecessary lock pair present in the ZC path, where
+  // handle_pkt re-acquires after the seqlock copy and wrapped_onmsg
+  // immediately releases again.
+  auto handle_pkt = [impl = sub->_impl](a0_locked_transport_t* tlk) {
+    a0_transport_frame_t frame;
+    a0_transport_frame(*tlk, &frame);
 
-            struct timespec start_copy;
-            struct timespec end_copy;
-            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_copy), "Failed clock_gettime");
-            a0_packet_t pkt;
-            a0_packet_deep_copy(pkt_zc, impl->alloc, &pkt);
-            A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_copy), "Failed clock_gettime");
-            a0_warn_if_past_threshold(&start_copy, &end_copy, A0_ALLOC_WARN_NS, "sub_callback allocation");
+    thread_local std::vector<uint8_t> frame_bytes;
+    if (frame.hdr.data_size <= A0_SUB_SEQLOCK_COPY_THRESHOLD) {
+      // Small frame: copy while holding the lock.  The hold is short and
+      // bounded (nanoseconds for typical small messages); no seqlock needed.
+      frame_bytes.resize(static_cast<size_t>(frame.hdr.data_size));
+      memcpy(frame_bytes.data(), frame.data, frame_bytes.size());
+      a0_transport_unlock(tlk);
+    } else {
+      // Large frame: release the lock before the potentially expensive copy
+      // so concurrent publishers and other subscribers are not blocked.
+      // Use a seqlock to detect if a concurrent commit evicted / overwrote
+      // this arena slot during the copy and retry if so.
+      a0_transport_unlock(tlk);
+      uint32_t seq;
+      do {
+        seq = a0_transport_seqcount(tlk->transport);
+        const auto* fhdr = reinterpret_cast<const a0_transport_frame_hdr_t*>(
+            static_cast<const uint8_t*>(tlk->transport->_arena.ptr) + frame.hdr.off);
+        frame_bytes.resize(static_cast<size_t>(fhdr->data_size));
+        memcpy(frame_bytes.data(), frame.data, frame_bytes.size());
+      } while (!a0_transport_seqcount_valid(tlk->transport, seq));
+    }
 
-            impl->onmsg.fn(impl->onmsg.user_data, pkt);
-          },
+    // Deserialize, deep_copy, and invoke the user callback — all outside the
+    // transport lock.  impl->alloc may call malloc; holding hdr->mu across
+    // that stalls every other subscriber and publisher.
+    thread_local a0::scope<a0_alloc_t> headers_alloc = a0::scope_realloc();
+    a0_buf_t local_buf = {frame_bytes.data(), frame_bytes.size()};
+    a0_packet_t pkt_deserialized;
+    a0_packet_deserialize(local_buf, *headers_alloc, &pkt_deserialized);
+
+    struct timespec start_copy;
+    struct timespec end_copy;
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_copy), "Failed clock_gettime");
+    a0_packet_t pkt;
+    a0_packet_deep_copy(pkt_deserialized, impl->alloc, &pkt);
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_copy), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&start_copy, &end_copy, A0_ALLOC_WARN_NS, "sub_callback allocation");
+
+    impl->onmsg.fn(impl->onmsg.user_data, pkt);
+
+    // Re-acquire the transport lock before returning.  The caller
+    // (transport_thread::handle_next_pkt / handle_first_pkt) holds a
+    // scoped_transport_lock that will call a0_transport_unlock() when it
+    // goes out of scope; the lock must be held at that point.
+    a0_transport_lock(tlk->transport, tlk);
   };
 
-  return a0_subscriber_zc_init(&sub->_impl->sub_zc, arena, sub_init, sub_iter, wrapped_onmsg);
+  auto on_transport_init = [impl = sub->_impl, sub_init](
+                               a0_locked_transport_t tlk,
+                               a0_transport_init_status_t) -> errno_t {
+    a0_transport_empty(tlk, &impl->started_empty);
+    if (!impl->started_empty) {
+      if (sub_init == A0_INIT_OLDEST) {
+        a0_transport_jump_head(tlk);
+      } else if (sub_init == A0_INIT_MOST_RECENT || sub_init == A0_INIT_AWAIT_NEW) {
+        a0_transport_jump_tail(tlk);
+      }
+    }
+    return A0_OK;
+  };
+
+  auto on_transport_nonempty = [impl = sub->_impl, sub_init, handle_pkt](
+                                   a0_locked_transport_t* tlk) {
+    bool reset = false;
+    if (impl->started_empty) {
+      reset = true;
+    } else {
+      bool ptr_valid;
+      a0_transport_ptr_valid(*tlk, &ptr_valid);
+      reset = !ptr_valid;
+    }
+
+    if (reset) {
+      a0_transport_jump_head(*tlk);
+    }
+
+    if (reset || sub_init == A0_INIT_OLDEST || sub_init == A0_INIT_MOST_RECENT) {
+      handle_pkt(tlk);
+    }
+  };
+
+  auto on_transport_hasnext = [sub_iter, handle_pkt](a0_locked_transport_t* tlk) {
+    struct timespec start_transport_manip;
+    struct timespec end_transport_manip;
+    struct timespec end_handler;
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &start_transport_manip), "Failed clock_gettime");
+    if (sub_iter == A0_ITER_NEXT) {
+      a0_transport_next(*tlk);
+    } else if (sub_iter == A0_ITER_NEWEST) {
+      a0_transport_jump_tail(*tlk);
+    }
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_transport_manip), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&start_transport_manip, &end_transport_manip, A0_MANIP_WARN_NS, "transport_hasnext manip");
+
+    handle_pkt(tlk);
+    A0_ASSERT_OK(clock_gettime(A0_PERF_CLOCK_SOURCE, &end_handler), "Failed clock_gettime");
+    a0_warn_if_past_threshold(&end_transport_manip, &end_handler, A0_HANDLER_WARN_NS, "transport_hasnext handler");
+  };
+
+  return sub->_impl->worker.init(arena,
+                                 on_transport_init,
+                                 on_transport_nonempty,
+                                 on_transport_hasnext);
 }
 
 errno_t a0_subscriber_close(a0_subscriber_t* sub) {
@@ -579,7 +683,7 @@ errno_t a0_subscriber_close(a0_subscriber_t* sub) {
     return ESHUTDOWN;
   }
 
-  auto err = a0_subscriber_zc_close(&sub->_impl->sub_zc);
+  auto err = sub->_impl->worker.await_close();
   delete sub->_impl;
   sub->_impl = nullptr;
 
@@ -591,28 +695,16 @@ errno_t a0_subscriber_async_close(a0_subscriber_t* sub, a0_callback_t onclose) {
     return ESHUTDOWN;
   }
 
-  struct heap_data {
-    a0_subscriber_t* sub_;
-    a0_callback_t onclose_;
-  };
-
-  a0_callback_t cb = {
-      .user_data = new heap_data{sub, onclose},
-      .fn = [](void* user_data) {
-        auto* data = (heap_data*)user_data;
-        delete data->sub_->_impl;
-        data->sub_->_impl = nullptr;
-        if (data->onclose_.fn) {
-          data->onclose_.fn(data->onclose_.user_data);
-        }
-        delete data;
-      },
-  };
-
-  // clang-tidy thinks the new heap_data is a leak.
-  // It can't track it through the callback.
+  // clang-tidy thinks the lambda capture of sub->_impl is a leak.
+  // It can't track it through the async callback.
   // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
-  return a0_subscriber_zc_async_close(&sub->_impl->sub_zc, cb);
+  return sub->_impl->worker.async_close([sub, onclose]() {
+    delete sub->_impl;
+    sub->_impl = nullptr;
+    if (onclose.fn) {
+      onclose.fn(onclose.user_data);
+    }
+  });
 }
 
 // One-off reader.
