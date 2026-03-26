@@ -1,0 +1,117 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "src",
+    srcs = glob(["**"]),
+)
+
+cc_library(
+    name = "alephzero",
+    srcs = glob(
+        [
+            "src/*.c",
+            "src/*.cpp",
+            "src/*.h",
+            "src/*.hpp",
+        ],
+        exclude = ["src/test/**/*"],
+    ),
+    hdrs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "src/mtx.h",
+        "src/transport_tools.hpp",
+    ]),
+    copts = [
+        "-DDEBUG",
+        "-Wno-parentheses",
+    ],
+    includes = [
+        "include",
+        "src",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lrt",
+    ],
+    deps = [
+        "@backward",
+        "@gtk_glib",
+    ],
+)
+
+cc_test(
+    name = "alephzero_test",
+    srcs = glob(["src/test/*"]) + [
+        "third_party/doctest/doctest/doctest.h",
+        "src/test_util.hpp",
+        "src/pmparser.h",
+        "src/sync.hpp",
+        "src/strutil.hpp",
+        "src/transport_debug.h",
+    ],
+    copts = ["-DDOCTEST_CONFIG_NO_POSIX_SIGNALS"],
+    includes = [
+        ".",
+        "third_party/doctest/doctest",
+    ],
+    deps = [":alephzero"],
+)
+
+cc_binary(
+    name = "bench_transport",
+    srcs = [
+        "src/bench/bench_transport.cpp",
+        "third_party/picobench/include/picobench/picobench.hpp",
+    ],
+    includes = ["third_party/picobench/include"],
+    deps = [":alephzero"],
+)
+
+cc_binary(
+    name = "bench_pubsub",
+    srcs = [
+        "src/bench/bench_pubsub.cpp",
+        "third_party/picobench/include/picobench/picobench.hpp",
+    ],
+    includes = ["third_party/picobench/include"],
+    deps = [":alephzero"],
+)
+
+# This exists because the main alephzero target depends on the
+# backward-cpp library which makes the unity API library crash at runtime.
+# See: https://thirdwaveautomation.atlassian.net/browse/SIM-285
+cc_library(
+    name = "alephzero_without_backward",
+    srcs = glob(
+        [
+            "src/*.c",
+            "src/*.cpp",
+            "src/*.h",
+            "src/*.hpp",
+        ],
+        exclude = ["src/test/**/*"],
+    ),
+    hdrs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "src/mtx.h",
+    ]),
+    copts = [
+        "-DDEBUG",
+        "-Wno-parentheses",
+    ],
+    includes = [
+        "include",
+        "src",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lrt",
+    ],
+    deps = ["@gtk_glib"],
+)
