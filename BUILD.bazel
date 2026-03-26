@@ -82,6 +82,12 @@ cc_binary(
     deps = [":alephzero"],
 )
 
+cc_binary(
+    name = "bench_pubsub_age",
+    srcs = ["src/bench/bench_pubsub_age.cpp"],
+    deps = [":alephzero"],
+)
+
 # This exists because the main alephzero target depends on the
 # backward-cpp library which makes the unity API library crash at runtime.
 # See: https://thirdwaveautomation.atlassian.net/browse/SIM-285
