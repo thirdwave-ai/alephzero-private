@@ -13,10 +13,24 @@ void a0_barrier() {
 
 A0_STATIC_INLINE
 void a0_spin() {
+#if defined(__x86_64__) || defined(__i386__)
   asm volatile("pause"
                :
                :
                : "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+  // ARM spin-loop hint (equivalent to x86 PAUSE).
+  asm volatile("yield"
+               :
+               :
+               : "memory");
+#else
+  // Portable fallback: compiler barrier only.
+  asm volatile(""
+               :
+               :
+               : "memory");
+#endif
 }
 
 #define a0_atomic_fetch_add(P, V) __sync_fetch_and_add((P), (V))
