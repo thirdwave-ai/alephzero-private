@@ -145,8 +145,13 @@ connect:
   A0_FAIL_ON_MINUS_ONE(fchmod(file->fd, opts->create_options.mode));
   A0_FAIL_ON_MINUS_ONE(ftruncate(file->fd, opts->create_options.size));
   A0_FAIL_ON_MINUS_ONE(fstat(file->fd, &file->stat));
-  if (rename(tmppath, path) == -1) {
-    // Check for a race condition. Another process has already made the final file.
+  // Link rather than rename. rename() does not fail when the destination exists, it
+  // atomically REPLACES it, so two openers that both see ENOENT would both succeed here and
+  // the loser would be left holding a valid mapping of an unlinked inode that nobody can
+  // reach by name again -- it publishes into a file no subscriber can ever open, and a0_pub
+  // keeps reporting success. link() fails with EEXIST instead, and we connect to the winner.
+  if (link(tmppath, path) == -1) {
+    // Another opener has already made the final file. Drop ours and connect to theirs.
     if (errno == EEXIST) {
       close(file->fd);
       remove(tmppath);
@@ -158,6 +163,8 @@ connect:
     }
     goto fail;
   }
+  // The file is now reachable under its real name; drop the temporary name.
+  remove(tmppath);
   goto cleanup;
 
 fail:
