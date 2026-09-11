@@ -7,9 +7,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <limits>
+#include <thread>
+#include <vector>
 
 #include "src/test_util.hpp"
 
@@ -356,4 +359,58 @@ TEST_CASE("file] readonly") {
     REQUIRE_OK(a0_file_open(TEST_FILE, &opt, &file));
     REQUIRE_OK(a0_file_close(&file));
   }
+}
+
+TEST_CASE("file] concurrent create connects to one inode") {
+  // Regression test for the topic-file creation race.
+  //
+  // a0_create_or_connect creates a missing file as a mkostemp temporary and moves it into
+  // place. If two openers both see ENOENT, both build a temporary and both move it, the
+  // second move must not replace the first: the loser keeps a valid mmap of a file that is
+  // no longer reachable by name, so it publishes into an inode nobody else can open, and
+  // a0_pub reports success forever. Every opener must end up on the inode that the path
+  // actually holds.
+  static const char* TEST_FILE = "/tmp/test_concurrent_create.a0";
+
+  static const int NUM_THREADS = 8;
+  static const int NUM_ITERATIONS = 200;
+
+  for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+    a0_file_remove(TEST_FILE);
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<ino_t> opened_inode(NUM_THREADS, 0);
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+      threads.emplace_back([&, i]() {
+        ready++;
+        while (!go) {
+        }
+        a0_file_t file;
+        if (a0_file_open(TEST_FILE, nullptr, &file) == A0_OK) {
+          opened_inode[i] = file.stat.st_ino;
+          a0_file_close(&file);
+        }
+      });
+    }
+
+    while (ready < NUM_THREADS) {
+    }
+    go = true;
+    for (auto& thread : threads) {
+      thread.join();
+    }
+
+    struct stat final_stat;
+    REQUIRE(stat(TEST_FILE, &final_stat) == 0);
+    for (int i = 0; i < NUM_THREADS; i++) {
+      REQUIRE(opened_inode[i] != 0);
+      // A thread whose inode is not the one at the path was silently orphaned.
+      REQUIRE(opened_inode[i] == final_stat.st_ino);
+    }
+  }
+
+  a0_file_remove(TEST_FILE);
 }
