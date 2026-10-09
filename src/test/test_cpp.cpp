@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <future>
@@ -26,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/scope.hpp"
 #include "src/sync.hpp"
 #include "src/test_util.hpp"
 
@@ -351,6 +353,54 @@ TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] pubsub") {
   }
   REQUIRE_THROWS_WITH(a0::Subscriber::read_one(file, A0_INIT_AWAIT_NEW, O_NONBLOCK),
                       "Resource temporarily unavailable");
+}
+
+TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] read_one returns its packet intact while more arrive") {
+  // read_one keeps the first packet its subscriber sees, but more can arrive before that subscriber
+  // closes. None of them may overwrite the packet read_one returns.
+  //
+  // Each payload names its own sequence number, from which its length and every byte follow, so a
+  // packet overwritten by another, or read from freed memory, does not check out. Lengths vary
+  // widely so that a later packet sometimes forces the buffer to be reallocated.
+  auto len_of = [](uint64_t seq) { return 1024 + (seq * 7919) % (256 * 1024); };
+  auto byte_of = [](uint64_t seq, size_t i) { return static_cast<char>((seq * 131 + i) & 0xff); };
+
+  std::atomic<bool> done{false};
+  std::thread writer([&]() {
+    a0::Publisher p(file);
+    for (uint64_t seq = 0; !done;) {
+      // Two back to back, so the second can land while read_one is closing after the first.
+      for (int burst = 0; burst < 2; burst++, seq++) {
+        std::string payload(sizeof(seq) + len_of(seq), '\0');
+        memcpy(&payload[0], &seq, sizeof(seq));
+        for (size_t i = 0; i < len_of(seq); i++) {
+          payload[sizeof(seq) + i] = byte_of(seq, i);
+        }
+        p.pub(payload);
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(seq % 2000));
+    }
+  });
+  // Declared after `writer`, so it runs first on every exit: a failed REQUIRE below throws, and
+  // destroying a still-joinable std::thread would terminate the whole test binary.
+  a0::scope<void> stop_writer([&]() {
+    done = true;
+    writer.join();
+  });
+
+  for (int i = 0; i < 500; i++) {
+    auto pkt = a0::Subscriber::read_one(file, A0_INIT_AWAIT_NEW);
+    std::string_view payload = pkt.payload();
+    REQUIRE(payload.size() >= sizeof(uint64_t));
+    uint64_t seq;
+    memcpy(&seq, payload.data(), sizeof(seq));
+    REQUIRE(payload.size() == sizeof(seq) + len_of(seq));
+    bool bytes_match = true;
+    for (size_t j = 0; j < len_of(seq) && bytes_match; j++) {
+      bytes_match = payload[sizeof(seq) + j] == byte_of(seq, j);
+    }
+    REQUIRE(bytes_match);
+  }
 }
 
 TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] sub throw") {

@@ -619,11 +619,12 @@ errno_t a0_subscriber_read_one(a0_arena_t arena,
     A0_RETURN_ERR_ON_ERR(a0_subscriber_sync_next(&sub_sync, out));
   } else {
     struct data_ {
+      a0_alloc_t alloc;
       a0_packet_t* pkt;
 
       a0::Event sub_event{};
       a0::Event done_event{};
-    } data{.pkt = out};
+    } data{.alloc = alloc, .pkt = out};
 
     a0_packet_callback_t cb = {
         .user_data = &data,
@@ -635,13 +636,16 @@ errno_t a0_subscriber_read_one(a0_arena_t arena,
               }
 
               data->sub_event.wait();
-              *data->pkt = pkt;
+              a0_packet_deep_copy(pkt, data->alloc, data->pkt);
               data->done_event.set();
             },
     };
 
+    // The subscriber copies every packet it sees into its allocator, including any that arrive
+    // after the first and before it closes. Give it its own, so only the first reaches `alloc`.
+    a0::scope<a0_alloc_t> sub_alloc = a0::scope_realloc();
     a0_subscriber_t sub;
-    A0_RETURN_ERR_ON_ERR(a0_subscriber_init(&sub, arena, alloc, sub_init, A0_ITER_NEXT, cb));
+    A0_RETURN_ERR_ON_ERR(a0_subscriber_init(&sub, arena, *sub_alloc, sub_init, A0_ITER_NEXT, cb));
 
     data.sub_event.set();
     data.done_event.wait();
