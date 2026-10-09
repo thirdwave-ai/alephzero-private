@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/scope.hpp"
 #include "src/sync.hpp"
 #include "src/test_util.hpp"
 
@@ -380,6 +381,12 @@ TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] read_one returns its packet intact whi
       std::this_thread::sleep_for(std::chrono::microseconds(seq % 2000));
     }
   });
+  // Declared after `writer`, so it runs first on every exit: a failed REQUIRE below throws, and
+  // destroying a still-joinable std::thread would terminate the whole test binary.
+  a0::scope<void> stop_writer([&]() {
+    done = true;
+    writer.join();
+  });
 
   for (int i = 0; i < 500; i++) {
     auto pkt = a0::Subscriber::read_one(file, A0_INIT_AWAIT_NEW);
@@ -394,9 +401,6 @@ TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] read_one returns its packet intact whi
     }
     REQUIRE(bytes_match);
   }
-
-  done = true;
-  writer.join();
 }
 
 TEST_CASE_FIXTURE(CppPubsubFixture, "cpp] sub throw") {
